@@ -11,7 +11,20 @@ import {
   TutorConversationStateService,
   TutorFlowStep,
   TutorMissingField,
+  TutorStateSnapshot,
 } from './tutor-conversation-state.service';
+import {
+  buildTutorLanguageInstruction,
+  buildTutorLowQualityFallback,
+  buildTutorRepairInstruction,
+  extractSessionResolvedLanguage,
+  mergeSessionLanguageTransition,
+  resolveTutorResponseLanguage,
+  resolveWhisperLanguage,
+  spokenLanguageToLocale,
+  TutorSpokenLanguage,
+} from './tutor-language.util';
+import { prepareTutorSpeechText } from './tutor-speech-text.util';
 
 /** Bump when tutor system prompt or structured response contract in `chat()` changes materially (simulation baselines / regression tracking). */
 export const AI_TUTOR_PROMPT_VERSION = '2026.04.10';
@@ -158,14 +171,6 @@ ${params.studentSubmission}
       fastResponse?: boolean;
     };
   }) {
-    const locale = params.context?.locale;
-    const isGreekLocale = !locale || locale === 'el-GR';
-    const responseLanguage = isGreekLocale ? 'el' : 'en';
-    const fieldLabels: Record<TutorMissingField, string> = {
-      grade: isGreekLocale ? 'τάξη' : 'grade',
-      subject: isGreekLocale ? 'μάθημα' : 'subject/topic',
-    };
-
     const state = await this.tutorConversationState.loadOrCreateState({
       userId: params.userId,
       sessionId: params.sessionId,
@@ -176,6 +181,19 @@ ${params.studentSubmission}
         learningMode: params.context?.learningMode,
       },
     });
+
+    const tutorLanguage = this.resolveTutorLanguageForRequest({
+      context: params.context,
+      state,
+      messageText: params.message,
+    });
+    const responseLanguage = tutorLanguage.resolved;
+    const isGreekLocale = tutorLanguage.isGreekResponse;
+    const responseLocaleCode = tutorLanguage.responseLocale;
+    const fieldLabels: Record<TutorMissingField, string> = {
+      grade: isGreekLocale ? 'τάξη' : 'grade',
+      subject: isGreekLocale ? 'μάθημα' : 'subject/topic',
+    };
 
     const effectiveContext = {
       ...(params.context || {}),
@@ -273,15 +291,18 @@ ${params.studentSubmission}
           lastAssistantQuestionHash: questionHash,
           lastAssistantMessageHash: this.hashTutorText(clarificationResponse.message),
           assumptions: state.assumptions,
-          lastTransition: {
-            fromStep: state.flowStep,
-            toStep: 'CLARIFY',
-            missingFields,
-            askedField: field,
-            forcedProgress: false,
-            mode: 'clarify_once',
-            at: new Date().toISOString(),
-          },
+          lastTransition: mergeSessionLanguageTransition(
+            {
+              fromStep: state.flowStep,
+              toStep: 'CLARIFY',
+              missingFields,
+              askedField: field,
+              forcedProgress: false,
+              mode: 'clarify_once',
+              at: new Date().toISOString(),
+            },
+            responseLanguage,
+          ),
         },
       });
 
@@ -338,6 +359,7 @@ ${params.studentSubmission}
         },
         progress: this.tutorConversationState.buildProgress(updatedState.flowStep),
         videoSuggestion: { shouldSuggest: false },
+        resolvedLanguage: responseLanguage,
       };
     }
 
@@ -354,8 +376,7 @@ ${params.studentSubmission}
       take: fastResponse ? 4 : 10,
     });
 
-    const languageInstruction =
-      '\n\nLANGUAGE: Η εφαρμογή είναι ελληνική. Πρέπει να απαντάς μόνο στα Ελληνικά (Ελληνικά) σε όλες τις απαντήσεις, εξηγήσεις και ανατροφοδότηση. Χρησιμοποίησε καθαρά, σωστά ελληνικά.';
+    const languageInstruction = buildTutorLanguageInstruction(responseLanguage);
 
     // Build system prompt with context
     const systemPrompt = `You are a friendly, supportive AI tutor helping a ${effectiveContext?.yearGroup || ''} student with their studies.
@@ -452,28 +473,27 @@ Response contract (REQUIRED):
 
     try {
       let { parsed, tokenCount } = await this.requestStructuredTutorCompletion(messages, { fast: fastResponse });
-      let { filtered, quality } = this.applyTutorQualityFilter(parsed, params.context?.locale);
+      let { filtered, quality } = this.applyTutorQualityFilter(parsed, responseLocaleCode);
 
       if (!fastResponse && quality.lowQuality) {
-        const repairInstruction =
-          'Επανέγραψε την προηγούμενη απάντηση με ΚΑΘΑΡΑ και σωστά Ελληνικά, χωρίς περίεργους ή αλλοιωμένους όρους, χωρίς ανάμειξη λατινικών χαρακτήρων μέσα σε ελληνικές λέξεις. Αν λείπουν στοιχεία, κάνε μία σύντομη διευκρινιστική ερώτηση αντί να εφεύρεις λέξεις. Επέστρεψε μόνο έγκυρο JSON στο ίδιο σχήμα.';
+        const repairInstruction = buildTutorRepairInstruction(responseLanguage);
         const retry = await this.requestStructuredTutorCompletion([
           ...messages,
           { role: 'user', content: repairInstruction },
         ]);
         tokenCount += retry.tokenCount;
-        const retried = this.applyTutorQualityFilter(retry.parsed, params.context?.locale);
+        const retried = this.applyTutorQualityFilter(retry.parsed, responseLocaleCode);
         filtered = retried.filtered;
         quality = retried.quality;
       }
 
       if (!fastResponse && quality.lowQuality) {
+        const lowQualityFallback = buildTutorLowQualityFallback(responseLanguage);
         filtered = {
-          message:
-            'Μπορείς να μου πεις λίγο πιο συγκεκριμένα ποιο σημείο σε δυσκολεύει; Έτσι θα σε βοηθήσω με καθαρά και σωστά βήματα.',
+          message: lowQualityFallback.message,
           structuredContent: {
-            plan: 'Ζητώ μία διευκρίνιση για να δώσω πιο ακριβή βοήθεια.',
-            hints: ['Πες μου μάθημα, κεφάλαιο και τι έχεις δοκιμάσει ήδη.'],
+            plan: lowQualityFallback.plan,
+            hints: lowQualityFallback.hints,
           },
         };
       }
@@ -530,14 +550,17 @@ Response contract (REQUIRED):
           lastAssistantMessageHash: this.hashTutorText(flatMessage),
           lastProgressAt: madeProgress ? new Date() : null,
           assumptions: mergedAssumptions,
-          lastTransition: {
-            fromStep: state.flowStep,
-            toStep: nextFlowStep,
-            missingFields,
-            assumptionsUsed,
-            mode: 'model_response',
-            at: new Date().toISOString(),
-          },
+          lastTransition: mergeSessionLanguageTransition(
+            {
+              fromStep: state.flowStep,
+              toStep: nextFlowStep,
+              missingFields,
+              assumptionsUsed,
+              mode: 'model_response',
+              at: new Date().toISOString(),
+            },
+            responseLanguage,
+          ),
         },
       });
 
@@ -621,17 +644,19 @@ Response contract (REQUIRED):
         videoSuggestion: shouldSuggest
           ? {
               shouldSuggest: true,
-              prompt:
-                params.context?.locale === 'el-GR'
-                  ? 'Θέλεις 2-3 σύντομα βίντεο πάνω σε αυτό;'
-                  : 'Want a couple of short videos on this?',
+              prompt: isGreekLocale
+                ? 'Θέλεις 2-3 σύντομα βίντεο πάνω σε αυτό;'
+                : 'Want a couple of short videos on this?',
               topicHint: params.message,
             }
           : { shouldSuggest: false },
+        resolvedLanguage: responseLanguage,
       };
     } catch (error) {
       console.error('Error in AI chat:', error);
-      const fallback = 'Έχω πρόβλημα σύνδεσης αυτή τη στιγμή. Δοκιμάστε ξανά σε λίγο.';
+      const fallback = isGreekLocale
+        ? 'Έχω πρόβλημα σύνδεσης αυτή τη στιγμή. Δοκιμάστε ξανά σε λίγο.'
+        : 'I am having trouble connecting right now. Please try again in a moment.';
       const parsedFallback = this.buildStructuredTutorFallback(
         JSON.stringify({
           message: fallback,
@@ -655,6 +680,7 @@ Response contract (REQUIRED):
         },
         progress: this.tutorConversationState.buildProgress(state.flowStep),
         videoSuggestion: { shouldSuggest: false },
+        resolvedLanguage: responseLanguage,
       };
     }
   }
@@ -825,9 +851,21 @@ Response contract (REQUIRED):
       throw new Error('OpenAI API key not configured');
     }
 
-      const isGreek = !params.context?.locale || params.context?.locale === 'el-GR';
-    const imageLanguageInstruction =
-      '\n\nLANGUAGE: Η εφαρμογή είναι ελληνική. Πρέπει να απαντάς μόνο στα Ελληνικά (Ελληνικά) σε όλη την ανάλυση και ανατροφοδότηση.';
+    const state = await this.tutorConversationState.loadOrCreateState({
+      userId: params.userId,
+      sessionId: params.sessionId,
+      context: {
+        currentSubject: params.context?.currentSubject,
+      },
+    });
+    const sessionResolved = extractSessionResolvedLanguage(state.lastTransition);
+    const responseLanguage = resolveTutorResponseLanguage({
+      appLocale: params.context?.locale,
+      messageText: params.userMessage,
+      sessionResolvedLanguage: sessionResolved,
+    });
+    const isGreek = responseLanguage === 'el';
+    const imageLanguageInstruction = buildTutorLanguageInstruction(responseLanguage);
 
     try {
       const imageBuffer = fs.readFileSync(params.imagePath);
@@ -995,15 +1033,29 @@ Use clear step-by-step equations where relevant (one transformation per line) an
         },
       });
 
+      await this.tutorConversationState.updateState({
+        stateId: state.id,
+        patch: {
+          lastTransition: mergeSessionLanguageTransition(
+            {
+              mode: 'image_response',
+              at: new Date().toISOString(),
+            },
+            responseLanguage,
+          ),
+        },
+      });
+
       return {
         message: aiResponse,
         sessionId: params.sessionId,
         imageAnalyzed: true,
         purpose,
+        resolvedLanguage: responseLanguage,
       };
     } catch (error) {
       console.error('Error processing image message:', error);
-      const errorMsg = params.context?.locale === 'el-GR'
+      const errorMsg = isGreek
         ? 'Έχω πρόβλημα να αναλύσω αυτή την εικόνα. Δοκιμάστε ξανά ή βεβαιωθείτε ότι η εικόνα είναι καθαρή και φωτεινή.'
         : "I'm having trouble analyzing that image right now. Please try again, or make sure the image is clear and well-lit.";
       return {
@@ -1011,6 +1063,7 @@ Use clear step-by-step equations where relevant (one transformation per line) an
         sessionId: params.sessionId,
         imageAnalyzed: false,
         error: error instanceof Error ? error.message : 'Unknown error',
+        resolvedLanguage: responseLanguage,
       };
     }
   }
@@ -1028,6 +1081,36 @@ Use clear step-by-step equations where relevant (one transformation per line) an
       'webp': 'image/webp',
     };
     return mimeTypes[ext || ''] || 'image/jpeg';
+  }
+
+  private resolveTutorLanguageForRequest(params: {
+    context?: { locale?: string };
+    state: TutorStateSnapshot;
+    messageText?: string;
+  }): {
+    resolved: TutorSpokenLanguage;
+    isGreekResponse: boolean;
+    responseLocale: 'el-GR' | 'en-GB';
+  } {
+    const sessionResolved = extractSessionResolvedLanguage(params.state.lastTransition);
+    const resolved = resolveTutorResponseLanguage({
+      appLocale: params.context?.locale,
+      messageText: params.messageText,
+      sessionResolvedLanguage: sessionResolved,
+    });
+
+    return {
+      resolved,
+      isGreekResponse: resolved === 'el',
+      responseLocale: spokenLanguageToLocale(resolved),
+    };
+  }
+
+  private estimateSpeechDurationMs(text: string, speed: number): number {
+    const words = text.split(/\s+/).filter(Boolean).length;
+    const baseWordsPerMinute = 145;
+    const minutes = words / (baseWordsPerMinute * speed);
+    return Math.max(1800, Math.round(minutes * 60 * 1000));
   }
 
   private hashTutorText(value: string): string {
@@ -1365,6 +1448,12 @@ Use clear step-by-step equations where relevant (one transformation per line) an
         issues.push('low_greek_ratio');
         score -= 30;
       }
+    } else if (locale === 'en-GB') {
+      const greekRatio = this.computeGreekCharacterRatio(text);
+      if (greekRatio > 0.2) {
+        issues.push('unexpected_greek_in_english');
+        score -= 25;
+      }
     }
 
     const knownBadCount = this.controlledCorrections.reduce((count, rule) => {
@@ -1428,7 +1517,8 @@ Use clear step-by-step equations where relevant (one transformation per line) an
     }
 
     const locale = params.locale || 'el-GR';
-    const isGreek = locale === 'el-GR';
+    const spokenLanguage: TutorSpokenLanguage = locale === 'en-GB' ? 'en' : 'el';
+    const isGreek = spokenLanguage === 'el';
     const speed = Math.max(0.8, Math.min(1.2, params.speed ?? 1.0));
     const voice = params.voice || 'alloy';
     const sections = this.buildSpeechSections(
@@ -1445,7 +1535,7 @@ Use clear step-by-step equations where relevant (one transformation per line) an
       const subChunks = this.splitIntoSpeechChunks(section.text, 320);
 
       for (let subIndex = 0; subIndex < subChunks.length; subIndex += 1) {
-        const normalized = this.prepareSpeechText(subChunks[subIndex], isGreek);
+        const normalized = prepareTutorSpeechText(subChunks[subIndex], spokenLanguage);
         const audioResponse = await (this.openai.audio.speech as any).create({
           model: 'gpt-4o-mini-tts',
           voice,
@@ -1575,79 +1665,6 @@ Use clear step-by-step equations where relevant (one transformation per line) an
     return chunks;
   }
 
-  private prepareSpeechText(text: string, isGreek: boolean): string {
-    let out = text;
-
-    out = out.replace(/\$\$([\s\S]*?)\$\$/g, '$1');
-    out = out.replace(/(?<!\$)\$([^$\n]+?)\$(?!\$)/g, '$1');
-
-    out = out.replace(/\\frac\{([^{}]+)\}\{([^{}]+)\}/g, (_, numerator: string, denominator: string) =>
-      this.formatFractionForSpeech(numerator, denominator, isGreek),
-    );
-    out = out.replace(/(\d+)\s*\/\s*(\d+)/g, (_, numerator: string, denominator: string) =>
-      this.formatFractionForSpeech(numerator, denominator, isGreek),
-    );
-    out = out.replace(/\\sqrt\{([^{}]+)\}/g, (_, value: string) =>
-      isGreek ? `τετραγωνική ρίζα του ${value}` : `square root of ${value}`,
-    );
-    out = out.replace(/\(([^()]+)\)\s*\^2/g, (_, value: string) =>
-      isGreek ? `${value}, όλο στο τετράγωνο` : `${value}, all squared`,
-    );
-    out = out.replace(
-      /([A-Za-zΑ-Ωα-ω0-9]+)\s*\^2\b/g,
-      (_, base: string) => (isGreek ? `${base} στο τετράγωνο` : `${base} squared`),
-    );
-    out = out.replace(
-      /([A-Za-zΑ-Ωα-ω0-9]+)\s*\^3\b/g,
-      (_, base: string) => (isGreek ? `${base} στον κύβο` : `${base} cubed`),
-    );
-    out = out.replace(
-      /([A-Za-zΑ-Ωα-ω0-9]+)\s*\^([4-9]|[1-9][0-9]+)\b/g,
-      (_, base: string, power: string) =>
-        isGreek ? `${base} στη δύναμη ${power}` : `${base} to the power of ${power}`,
-    );
-
-    out = out.replace(/\bm\/s\b/g, isGreek ? 'μέτρα ανά δευτερόλεπτο' : 'meters per second');
-    out = out.replace(/\bN\b/g, isGreek ? 'Νιούτον' : 'newtons');
-    out = out.replace(/\bJ\b/g, isGreek ? 'Τζάουλ' : 'joules');
-
-    out = out
-      .replace(/[=]/g, isGreek ? ' ισούται με ' : ' equals ')
-      .replace(/[×]/g, isGreek ? ' επί ' : ' times ')
-      .replace(/[-]/g, isGreek ? ' μείον ' : ' minus ')
-      .replace(/[+]/g, isGreek ? ' συν ' : ' plus ');
-
-    out = out.replace(/\s+/g, ' ').trim();
-    return out;
-  }
-
-  private formatFractionForSpeech(numerator: string, denominator: string, isGreek: boolean) {
-    const simpleFractions: Record<string, { en: string; el: string }> = {
-      '1/2': { en: 'one half', el: 'ένα δεύτερο' },
-      '1/3': { en: 'one third', el: 'ένα τρίτο' },
-      '2/3': { en: 'two thirds', el: 'δύο τρίτα' },
-      '1/4': { en: 'one quarter', el: 'ένα τέταρτο' },
-      '3/4': { en: 'three quarters', el: 'τρία τέταρτα' },
-    };
-    const key = `${numerator}/${denominator}`;
-    const known = simpleFractions[key];
-    if (known) return isGreek ? known.el : known.en;
-    return isGreek
-      ? `${numerator} προς ${denominator}`
-      : `${numerator} over ${denominator}`;
-  }
-
-  private estimateSpeechDurationMs(text: string, speed: number): number {
-    const words = text.split(/\s+/).filter(Boolean).length;
-    const baseWordsPerMinute = 145;
-    const minutes = words / (baseWordsPerMinute * speed);
-    return Math.max(1800, Math.round(minutes * 60 * 1000));
-  }
-
-  /**
-   * Process voice message - transcribe audio and get AI response
-   * Uses OpenAI Whisper for speech-to-text
-   */
   async processVoiceMessage(params: {
     userId: string;
     sessionId: string;
@@ -1663,17 +1680,28 @@ Use clear step-by-step equations where relevant (one transformation per line) an
       throw new Error('OpenAI API key not configured');
     }
 
-    const isGreek = !params.context?.locale || params.context?.locale === 'el-GR';
+    const state = await this.tutorConversationState.loadOrCreateState({
+      userId: params.userId,
+      sessionId: params.sessionId,
+      context: {
+        currentSubject: params.context?.currentSubject,
+        learningMode: params.context?.learningMode,
+      },
+    });
+    const sessionResolved = extractSessionResolvedLanguage(state.lastTransition);
+    const provisionalLanguage = resolveTutorResponseLanguage({
+      appLocale: params.context?.locale,
+      sessionResolvedLanguage: sessionResolved,
+    });
+    const isGreek = provisionalLanguage === 'el';
 
     try {
-      // Step 1: Transcribe audio using Whisper (Greek or English)
       const audioFile = fs.createReadStream(params.audioFilePath);
-
-      const whisperLanguage = params.context?.locale === 'en-GB' ? 'en' : 'el';
+      const whisperLanguage = resolveWhisperLanguage(sessionResolved);
       const transcription = await this.openai.audio.transcriptions.create({
         file: audioFile,
         model: 'whisper-1',
-        language: whisperLanguage,
+        ...(whisperLanguage ? { language: whisperLanguage } : {}),
       });
 
       const transcribedText = transcription.text;
@@ -1685,10 +1713,10 @@ Use clear step-by-step equations where relevant (one transformation per line) an
             ? 'Δεν ακούστηκε καθαρά. Μπορείτε να δοκιμάσετε ξανά;'
             : "I couldn't hear that clearly. Could you please try again?",
           sessionId: params.sessionId,
+          resolvedLanguage: provisionalLanguage,
         };
       }
 
-      // Step 2: Get AI response (in Greek when locale is el-GR)
       const chatResponse = await this.chat({
         userId: params.userId,
         sessionId: params.sessionId,
@@ -1704,11 +1732,11 @@ Use clear step-by-step equations where relevant (one transformation per line) an
         transcription: transcribedText,
         message: chatResponse.message,
         sessionId: params.sessionId,
+        resolvedLanguage: chatResponse.resolvedLanguage || provisionalLanguage,
       };
     } catch (error) {
       console.error('Error processing voice message:', error);
-      
-      // Check if it's an OpenAI API error
+
       if (error instanceof Error && error.message.includes('Invalid file format')) {
         return {
           transcription: '',
@@ -1716,6 +1744,7 @@ Use clear step-by-step equations where relevant (one transformation per line) an
             ? 'Πρόβλημα με τη μορφή του ήχου. Δοκιμάστε να ηχογραφήσετε ξανά.'
             : "Sorry, there was a problem with the audio format. Please try recording again.",
           sessionId: params.sessionId,
+          resolvedLanguage: provisionalLanguage,
         };
       }
 
@@ -1725,6 +1754,7 @@ Use clear step-by-step equations where relevant (one transformation per line) an
           ? 'Έχω πρόβλημα να επεξεργαστώ το φωνητικό μήνυμα. Δοκιμάστε να γράψετε.'
           : "I'm having trouble processing your voice message right now. Please try typing instead.",
         sessionId: params.sessionId,
+        resolvedLanguage: provisionalLanguage,
       };
     }
   }
