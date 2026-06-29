@@ -94,9 +94,9 @@ export function buildTutorLowQualityFallback(language: TutorSpokenLanguage): {
   };
 }
 
-/** Hint Whisper when session language is known; otherwise let it auto-detect. */
+/** Let Whisper auto-detect so a Greek session can still preserve English speech as English text. */
 export function resolveWhisperLanguage(
-  sessionResolvedLanguage?: TutorSpokenLanguage,
+  _sessionResolvedLanguage?: TutorSpokenLanguage,
 ): TutorSpokenLanguage | undefined {
-  return sessionResolvedLanguage;
+  return undefined;
 }

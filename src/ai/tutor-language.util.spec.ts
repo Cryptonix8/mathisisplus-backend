@@ -44,8 +44,9 @@ describe('tutor-language.util', () => {
     expect(extractSessionResolvedLanguage(merged)).toBe('en');
   });
 
-  it('lets Whisper auto-detect when session language is unknown', () => {
+  it('lets Whisper auto-detect even when a session language already exists', () => {
     expect(resolveWhisperLanguage(undefined)).toBeUndefined();
-    expect(resolveWhisperLanguage('en')).toBe('en');
+    expect(resolveWhisperLanguage('en')).toBeUndefined();
+    expect(resolveWhisperLanguage('el')).toBeUndefined();
   });
 });
